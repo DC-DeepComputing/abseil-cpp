@@ -245,6 +245,132 @@ TEST(ExponentialBiasedTest, InitializationModes) {
   EXPECT_THAT(eb_stack.GetSkipCount(2), Ge(0));
 }
 
+TEST(SamplingStateTest, DisabledAndAlwaysOn) {
+  ExponentialBiased eb;
+  SamplingState state;
+
+  ASSERT_TRUE(ShouldSampleNext(state));
+  EXPECT_EQ(eb.ConfirmSampleSlow(state, /*period=*/0, /*step=*/1,
+                                 /*disabled_stride=*/1234),
+            0);
+  EXPECT_EQ(state.next_sample, 1234);
+  EXPECT_EQ(state.sample_period, 0);
+
+  // Period 1 samples every event with weight == step, including event #1.
+  state = {0, 0};
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_TRUE(ShouldSampleNext(state));
+    EXPECT_EQ(eb.ConfirmSampleSlow(state, /*period=*/1), 1);
+  }
+
+  state = {0, 0};
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_TRUE(ShouldSampleNext(state, /*step=*/65));
+    EXPECT_EQ(eb.ConfirmSampleSlow(state, /*period=*/1, /*step=*/65), 65);
+  }
+}
+
+TEST(SamplingStateTest, UnitStepConstantWeightAndShortThreadStartup) {
+  ExponentialBiased eb;
+  constexpr int64_t kPeriod = 16;
+  constexpr int kTrials = 64000;
+
+  // Early items on a fresh thread must always receive weight == kPeriod (never
+  // the realized initial stride <= t). Note `GetStride()`'s `std::rint`
+  // `[0, 0.5)` zero bin samples item #1 at ~0.5 / kPeriod, while item #2+
+  // already samples at 1 / kPeriod.
+  int first_item_samples = 0;
+  int64_t second_item_weight_sum = 0;
+  for (int i = 0; i < kTrials; ++i) {
+    SamplingState fresh_state = {0, 0};
+    if (ShouldSampleNext(fresh_state)) {
+      const int64_t w1 = eb.ConfirmSampleSlow(fresh_state, kPeriod);
+      if (w1 > 0) {
+        ASSERT_EQ(w1, kPeriod);
+        ++first_item_samples;
+      }
+    }
+    if (ShouldSampleNext(fresh_state)) {
+      const int64_t w2 = eb.ConfirmSampleSlow(fresh_state, kPeriod);
+      if (w2 > 0) {
+        ASSERT_EQ(w2, kPeriod);
+        second_item_weight_sum += w2;
+      }
+    }
+  }
+  EXPECT_GT(first_item_samples, 1000);
+  // Expected = 64000, std ~= 980 (old `weight = stride` gave ~6000).
+  EXPECT_THAT(second_item_weight_sum, IsBetween(56000, 72000));
+
+  // Steady-state sequential items all carry constant weight == kPeriod.
+  constexpr int64_t kSteadyPeriod = 32;
+  constexpr int kEvents = 320000;
+  SamplingState state = {0, 0};
+  int64_t steady_weight_sum = 0;
+  for (int i = 0; i < kEvents; ++i) {
+    if (ShouldSampleNext(state)) {
+      const int64_t w = eb.ConfirmSampleSlow(state, kSteadyPeriod);
+      if (w > 0) {
+        ASSERT_EQ(w, kSteadyPeriod);
+        steady_weight_sum += w;
+      }
+    }
+  }
+  // Expected = 320000, std ~= 3149.
+  EXPECT_THAT(steady_weight_sum, IsBetween(280000, 360000));
+}
+
+TEST(SamplingStateTest, PreservesInFlightPeriodAcrossRateChange) {
+  ExponentialBiased eb;
+  SamplingState state = {/*next_sample=*/0, /*sample_period=*/100};
+
+  // Completed stride ran under period 100; new stride runs under period 500.
+  EXPECT_EQ(eb.ConfirmSampleSlow(state, /*period=*/500), 100);
+  EXPECT_EQ(state.sample_period, 500);
+  EXPECT_GT(state.next_sample, 0);
+
+  state.next_sample = 0;
+  EXPECT_EQ(eb.ConfirmSampleSlow(state, /*period=*/500), 500);
+}
+
+TEST(SamplingStateTest, WeightedStepOvershootUnbiased) {
+  ExponentialBiased eb;
+  constexpr int64_t kPeriod = 4096;
+  // 2x period: exercises multi-period overshoot.
+  constexpr int64_t kSize = 8192;
+  constexpr int64_t kStep = kSize + 1;
+  constexpr int kAllocs = 100000;
+
+  SamplingState state = {0, 0};
+  double estimated_bytes = 0;
+  for (int i = 0; i < kAllocs; ++i) {
+    if (ShouldSampleNext(state, kStep)) {
+      const int64_t w = eb.ConfirmSampleSlow(state, kPeriod, kStep);
+      if (w > 0) {
+        EXPECT_GE(w, kPeriod);
+        estimated_bytes += static_cast<double>(w) * kSize / kStep;
+      }
+    }
+  }
+  const double exact_bytes = static_cast<double>(kAllocs) * kSize;
+  EXPECT_THAT(estimated_bytes,
+              IsBetween(0.95 * exact_bytes, 1.05 * exact_bytes));
+}
+
+TEST(SamplingStateTest, SampleWithLivePeriodResetsImmediately) {
+  ExponentialBiased eb;
+  SamplingState state = {0, 0};
+
+  EXPECT_EQ(SampleWithLivePeriod(state, /*period=*/0, eb), 0);
+  EXPECT_EQ(state.sample_period, 0);
+
+  // Arm a long stride, then switch to period = 1 and verify immediate reset.
+  (void)SampleWithLivePeriod(state, /*period=*/1000000, eb);
+  EXPECT_EQ(state.sample_period, 1000000);
+  EXPECT_EQ(SampleWithLivePeriod(state, /*period=*/1, eb), 1);
+  EXPECT_EQ(state.sample_period, 1);
+}
+
 }  // namespace
 }  // namespace profiling_internal
 ABSL_NAMESPACE_END

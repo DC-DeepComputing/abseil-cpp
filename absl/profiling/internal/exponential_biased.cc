@@ -74,6 +74,39 @@ int64_t ExponentialBiased::GetStride(int64_t mean) {
   return GetSkipCount(mean - 1) + 1;
 }
 
+int64_t ExponentialBiased::ConfirmSampleSlow(SamplingState& state,
+                                             int64_t period, int64_t step,
+                                             int64_t disabled_stride) {
+  if (period <= 0) {
+    state = {disabled_stride > 0 ? disabled_stride : (int64_t{1} << 16), 0};
+    return 0;
+  }
+  if (ABSL_PREDICT_FALSE(step < 1)) {
+    step = 1;
+  }
+  if (state.sample_period <= 0) {
+    state.sample_period = period;
+    const int64_t initial_stride = (period == 1) ? 1 : GetStride(period);
+    state.next_sample = initial_stride - step;
+    if (ABSL_PREDICT_TRUE(state.next_sample > 0)) {
+      return 0;
+    }
+  }
+
+  int64_t weight;
+  const int64_t max_int64 = (std::numeric_limits<int64_t>::max)();
+  if (ABSL_PREDICT_FALSE(state.next_sample < 0 &&
+                         state.sample_period > max_int64 + state.next_sample)) {
+    weight = max_int64;
+  } else {
+    weight = state.sample_period - state.next_sample;
+  }
+
+  state.sample_period = period;
+  state.next_sample = (period == 1) ? 1 : GetStride(period);
+  return weight;
+}
+
 void ExponentialBiased::Initialize() {
   // We don't get well distributed numbers from `this` so we call NextRandom() a
   // bunch to mush the bits around. We use a global_rand to handle the case

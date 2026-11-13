@@ -128,6 +128,46 @@ TEST(CordzFunctionsTest, ShouldProfileRate) {
   set_cordz_mean_interval(orig_sample_rate);
 }
 
+TEST(CordzFunctionsTest, SampleWeightEqualsMeanInterval) {
+  const int32_t orig_sample_rate = get_cordz_mean_interval();
+  constexpr int32_t kInterval = 16;
+  constexpr int kTrials = 64000;
+  set_cordz_mean_interval(kInterval);
+
+  int first_cord_samples = 0;
+  int64_t second_cord_weight_sum = 0;
+  for (int i = 0; i < kTrials; ++i) {
+    cordz_set_next_sample_for_testing(-1);
+    const int64_t w1 = cordz_should_profile();
+    if (w1 > 0) {
+      ASSERT_EQ(w1, kInterval);
+      ++first_cord_samples;
+    }
+    const int64_t w2 = cordz_should_profile();
+    if (w2 > 0) {
+      ASSERT_EQ(w2, kInterval);
+      second_cord_weight_sum += w2;
+    }
+  }
+  EXPECT_THAT(first_cord_samples, Ge(1000));
+  EXPECT_THAT(second_cord_weight_sum, Ge(56000));
+  EXPECT_THAT(second_cord_weight_sum, Le(72000));
+
+  cordz_set_next_sample_for_testing(-1);
+  int64_t steady_weight_sum = 0;
+  for (int i = 0; i < kTrials; ++i) {
+    const int64_t w = cordz_should_profile();
+    if (w > 0) {
+      ASSERT_EQ(w, kInterval);
+      steady_weight_sum += w;
+    }
+  }
+  EXPECT_THAT(steady_weight_sum, Ge(52000));
+  EXPECT_THAT(steady_weight_sum, Le(76000));
+
+  set_cordz_mean_interval(orig_sample_rate);
+}
+
 #else  // ABSL_INTERNAL_CORDZ_ENABLED
 
 TEST(CordzFunctionsTest, ShouldProfileDisabled) {

@@ -288,15 +288,16 @@ TEST(HashtablezSamplerTest, SmallSampleParameter) {
   SetHashtablezSampleParameter(100);
 
   for (int i = 0; i < 1000; ++i) {
-    SamplingState next_sample = {0, 0};
+    SamplingState next_sample = {0, 100};
     HashtablezInfo* sample =
         SampleSlow(next_sample, test_element_size,
                    /*key_size=*/test_key_size, /*value_size=*/test_value_size,
 
                    /*soo_capacity=*/0);
     EXPECT_GT(next_sample.next_sample, 0);
-    EXPECT_EQ(next_sample.next_sample, next_sample.sample_stride);
-    EXPECT_NE(sample, nullptr);
+    EXPECT_EQ(next_sample.sample_period, 100);
+    ASSERT_NE(sample, nullptr);
+    EXPECT_EQ(sample->weight, 100);
     UnsampleSlow(sample);
   }
 }
@@ -305,20 +306,56 @@ TEST(HashtablezSamplerTest, LargeSampleParameter) {
   const size_t test_element_size = 31;
   const size_t test_key_size = 33;
   const size_t test_value_size = 35;
+  constexpr int32_t kMaxParam = (std::numeric_limits<int32_t>::max)();
   SetHashtablezEnabled(true);
-  SetHashtablezSampleParameter(std::numeric_limits<int32_t>::max());
+  SetHashtablezSampleParameter(kMaxParam);
 
   for (int i = 0; i < 1000; ++i) {
-    SamplingState next_sample = {0, 0};
+    SamplingState next_sample = {0, kMaxParam};
     HashtablezInfo* sample =
         SampleSlow(next_sample, test_element_size,
                    /*key_size=*/test_key_size, /*value_size=*/test_value_size,
                    /*soo_capacity=*/0);
     EXPECT_GT(next_sample.next_sample, 0);
-    EXPECT_EQ(next_sample.next_sample, next_sample.sample_stride);
-    EXPECT_NE(sample, nullptr);
+    EXPECT_EQ(next_sample.sample_period, kMaxParam);
+    ASSERT_NE(sample, nullptr);
+    EXPECT_EQ(sample->weight, kMaxParam);
     UnsampleSlow(sample);
   }
+}
+
+TEST(HashtablezSamplerTest, EarlyTableWeightEqualsSampleParameter) {
+  SetHashtablezEnabled(true);
+  constexpr int32_t kRate = 16;
+  SetHashtablezSampleParameter(kRate);
+
+  constexpr int kTrials = 64000;
+  int first_table_samples = 0;
+  int64_t second_table_weight_sum = 0;
+  for (int i = 0; i < kTrials; ++i) {
+    global_next_sample = {0, 0};
+    HashtablezInfoHandle h1 =
+        SampleForTesting(/*inline_element_size=*/32, /*key_size=*/16,
+                         /*value_size=*/16, /*soo_capacity=*/0);
+    if (HashtablezInfo* info = HashtablezInfoHandlePeer::GetInfo(&h1);
+        info != nullptr) {
+      EXPECT_EQ(info->weight, kRate);
+      ++first_table_samples;
+      h1.Unregister();
+    }
+    HashtablezInfoHandle h2 =
+        SampleForTesting(/*inline_element_size=*/32, /*key_size=*/16,
+                         /*value_size=*/16, /*soo_capacity=*/0);
+    if (HashtablezInfo* info = HashtablezInfoHandlePeer::GetInfo(&h2);
+        info != nullptr) {
+      EXPECT_EQ(info->weight, kRate);
+      second_table_weight_sum += info->weight;
+      h2.Unregister();
+    }
+  }
+  EXPECT_GT(first_table_samples, 1000);
+  EXPECT_GE(second_table_weight_sum, 56000);
+  EXPECT_LE(second_table_weight_sum, 72000);
 }
 
 TEST(HashtablezSamplerTest, Sample) {
