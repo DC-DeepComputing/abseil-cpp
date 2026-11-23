@@ -17,6 +17,7 @@
 #if defined(ABSL_CRC_INTERNAL_HAVE_RISCV_ZVBC)
 
 #include "absl/base/config.h"
+#include "absl/crc/internal/crc.h"
 
 namespace absl {
 ABSL_NAMESPACE_BEGIN
@@ -27,9 +28,9 @@ namespace riscv_zvbc {
 #include <stdint.h>
 #include <string.h>
 
-static inline uint32_t crc_bitwise(uint32_t crc,const uint8_t* buf,size_t len){
-  uint32_t c=crc;for(size_t i=0;i<len;i++){c^=buf[i];for(int k=0;k<8;k++)c=(c>>1)^((c&1)?0x82F63B78U:0);}return c;
-}
+// Folding constants for CRC32C (Castagnoli).  fold_const[0..1]: fold by a full
+// 64B vector block; fold_const[2..3]: fold one 16B sub-block onto another
+// (4-lane reduction); C0/C1/CQUO/CPOLY: Barrett reduction constants.
 static const uint64_t fold_const[4]={0x00000000740eef02ULL,0x000000009e4addf8ULL,0x00000000f20c0dfeULL,0x00000000493c7d27ULL};
 #define C0 0x00000000dd45aab8ULL
 #define C1 0x00000000493c7d27ULL
@@ -48,51 +49,52 @@ static inline uint32_t barrett(uint64_t lo,uint64_t hi){
   t4^=t3;
   return (uint32_t)((t4>>32)&M32);
 }
-/* fold 4 lanes: (vlo,vhi) = fold((vlo,vhi), k0,k1) xor data (dlo,dhi) */
-static inline void vfold(vuint64m2_t* vlo,vuint64m2_t* vhi,uint64_t k0,uint64_t k1,
-                          vuint64m2_t dlo,vuint64m2_t dhi){
-  vuint64m2_t k0v=__riscv_vmv_v_x_u64m2(k0,4),k1v=__riscv_vmv_v_x_u64m2(k1,4);
-  vuint64m2_t lo=__riscv_vclmul_vv_u64m2(*vlo,k0v,4);
-  lo=__riscv_vxor_vv_u64m2(lo,__riscv_vclmul_vv_u64m2(*vhi,k1v,4),4);
-  /* clmulh via vclmul with shifted? Zvbc has vclmulh? check */
-  vuint64m2_t hi=__riscv_vclmulh_vv_u64m2(*vlo,k0v,4);
-  hi=__riscv_vxor_vv_u64m2(hi,__riscv_vclmulh_vv_u64m2(*vhi,k1v,4),4);
-  *vlo=__riscv_vxor_vv_u64m2(lo,dlo,4);
-  *vhi=__riscv_vxor_vv_u64m2(hi,dhi,4);
-}
+
 uint32_t Extend(uint32_t crc, const char* buf, size_t len){
-  crc^=0xffffffffU;
-  const uint8_t* p=reinterpret_cast<const uint8_t*>(buf);size_t n=len;
-  size_t pre=(16-((uintptr_t)p&15))&15;if(pre>n)pre=n;
-  uint32_t c=crc_bitwise(crc,p,pre);p+=pre;n-=pre;
-  if(n<64)return crc_bitwise(c,p,n)^0xffffffffU;
-  uint64_t deint[8];memcpy(deint,p,64);
-  uint64_t first[4]={deint[0],deint[2],deint[4],deint[6]};
-  uint64_t second[4]={deint[1],deint[3],deint[5],deint[7]};
-  first[0]^=(uint64_t)c;
-  vuint64m2_t vlo=__riscv_vle64_v_u64m2(first,4);
-  vuint64m2_t vhi=__riscv_vle64_v_u64m2(second,4);
-  p+=64;n-=64;
-  const uint64_t k1=fold_const[0],k2=fold_const[1];
-  while(n>=64){
-    uint64_t de[8];memcpy(de,p,64);
-    uint64_t dl[4]={de[0],de[2],de[4],de[6]},dh[4]={de[1],de[3],de[5],de[7]};
-    vuint64m2_t dlo=__riscv_vle64_v_u64m2(dl,4),dhi=__riscv_vle64_v_u64m2(dh,4);
-    vfold(&vlo,&vhi,k1,k2,dlo,dhi);
+  uint32_t c=crc^0xffffffffU;
+  const uint8_t* p=reinterpret_cast<const uint8_t*>(buf);
+  size_t n=len;
+  if(n>=64){
+    /* RVV loads are unaligned: no pre-alignment needed.  Strided loads
+       (stride=16B) deinterleave the 64B block into lo/hi lane pairs without
+       any memcpy round-trip. */
+    vuint64m2_t vlo=__riscv_vlse64_v_u64m2(reinterpret_cast<const unsigned long*>(p),16,4);
+    vuint64m2_t vhi=__riscv_vlse64_v_u64m2(reinterpret_cast<const unsigned long*>(p+8),16,4);
+    { uint64_t tmp[4]={(uint64_t)c,0,0,0};
+      vuint64m2_t c0=__riscv_vle64_v_u64m2(tmp,4);
+      vlo=__riscv_vxor_vv_u64m2(vlo,c0,4); }
     p+=64;n-=64;
+    const uint64_t k1=fold_const[0],k2=fold_const[1];
+    vuint64m2_t k0v=__riscv_vmv_v_x_u64m2(k1,4),k1v=__riscv_vmv_v_x_u64m2(k2,4);
+    while(n>=64){
+      vuint64m2_t dlo=__riscv_vlse64_v_u64m2(reinterpret_cast<const unsigned long*>(p),16,4);
+      vuint64m2_t dhi=__riscv_vlse64_v_u64m2(reinterpret_cast<const unsigned long*>(p+8),16,4);
+      vuint64m2_t lo=__riscv_vclmul_vv_u64m2(vlo,k0v,4);
+      lo=__riscv_vxor_vv_u64m2(lo,__riscv_vclmul_vv_u64m2(vhi,k1v,4),4);
+      vuint64m2_t hi=__riscv_vclmulh_vv_u64m2(vlo,k0v,4);
+      hi=__riscv_vxor_vv_u64m2(hi,__riscv_vclmulh_vv_u64m2(vhi,k1v,4),4);
+      vlo=__riscv_vxor_vv_u64m2(lo,dlo,4);
+      vhi=__riscv_vxor_vv_u64m2(hi,dhi,4);
+      p+=64;n-=64;
+    }
+    /* 4 lanes -> 1 */
+    uint64_t lo[4],hi[4];__riscv_vse64(lo,vlo,4);__riscv_vse64(hi,vhi,4);
+    uint64_t x0=lo[0],x1=hi[0];
+    for(int i=1;i<4;i++){
+      uint64_t l,r;asm volatile("clmul %0,%1,%2":"=r"(l):"r"(x0),"r"(fold_const[2]));
+      asm volatile("clmulh %0,%1,%2":"=r"(r):"r"(x0),"r"(fold_const[2]));
+      uint64_t l2,r2;asm volatile("clmul %0,%1,%2":"=r"(l2):"r"(x1),"r"(fold_const[3]));
+      asm volatile("clmulh %0,%1,%2":"=r"(r2):"r"(x1),"r"(fold_const[3]));
+      x0=l^l2^lo[i];x1=r^r2^hi[i];
+    }
+    c=barrett(x0,x1);
   }
-  /* reduce 4 lanes -> 1 (need fold by k3,k4 across lanes: scalar extract) */
-  uint64_t lo[4],hi[4];__riscv_vse64(lo,vlo,4);__riscv_vse64(hi,vhi,4);
-  uint64_t x0=lo[0],x1=hi[0];
-  for(int i=1;i<4;i++){
-    uint64_t l,r;asm volatile("clmul %0,%1,%2":"=r"(l):"r"(x0),"r"(fold_const[2]));
-    asm volatile("clmulh %0,%1,%2":"=r"(r):"r"(x0),"r"(fold_const[2]));
-    uint64_t l2,r2;asm volatile("clmul %0,%1,%2":"=r"(l2):"r"(x1),"r"(fold_const[3]));
-    asm volatile("clmulh %0,%1,%2":"=r"(r2):"r"(x1),"r"(fold_const[3]));
-    x0=l^l2^lo[i];x1=r^r2^hi[i];
-  }
-  c=barrett(x0,x1);
-  if(n)c=crc_bitwise(c,p,n);
+  /* Tail / short input: the scalar fold chain cannot shift the initial crc by
+     an arbitrary bit count without per-shift constants, so continue in the
+     reflected value domain with the portable slicing-by-8 engine (2-4x faster
+     per byte than a bitwise loop, and seamlessly composable with the Barrett
+     output). */
+  if(n) absl::crc_internal::CRC::Crc32c()->Extend(&c,reinterpret_cast<const char*>(p),n);
   return c^0xffffffffU;
 }
 
