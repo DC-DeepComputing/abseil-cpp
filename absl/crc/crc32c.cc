@@ -19,6 +19,7 @@
 
 #include "absl/crc/internal/crc.h"
 #include "absl/crc/internal/crc32c.h"
+#include "absl/crc/internal/crc32_riscv_zvbc.h"
 #include "absl/crc/internal/crc_memcpy.h"
 #include "absl/strings/string_view.h"
 
@@ -48,9 +49,14 @@ crc32c_t UnextendCrc32cByZeroes(crc32c_t initial_crc, size_t length) {
 // when hardware CRC32C support is missing.
 crc32c_t ExtendCrc32cInternal(crc32c_t initial_crc,
                               absl::string_view buf_to_add) {
+#if defined(ABSL_CRC_INTERNAL_HAVE_RISCV_ZVBC)
+  return crc32c_t{riscv_zvbc::Extend(static_cast<uint32_t>(initial_crc),
+                                    buf_to_add.data(), buf_to_add.size())};
+#else
   uint32_t crc = static_cast<uint32_t>(initial_crc) ^ kCRC32Xor;
   CrcEngine()->Extend(&crc, buf_to_add.data(), buf_to_add.size());
   return static_cast<crc32c_t>(crc ^ kCRC32Xor);
+#endif
 }
 
 }  // namespace crc_internal

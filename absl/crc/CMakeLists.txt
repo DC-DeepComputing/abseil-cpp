@@ -42,9 +42,11 @@ absl_cc_library(
   HDRS
     "crc32c.h"
     "internal/crc32c.h"
+    "internal/crc32_riscv_zvbc.h"
     "internal/crc_memcpy.h"
   SRCS
     "crc32c.cc"
+    "internal/crc32_riscv_zvbc.cc"
     "internal/crc32c_inline.h"
     "internal/crc_memcpy_fallback.cc"
     "internal/crc_memcpy_x86_arm_combined.cc"
